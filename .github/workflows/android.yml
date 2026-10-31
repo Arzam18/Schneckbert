@@ -48,16 +48,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
           TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
-
           test -x "$TOOLCHAIN/clang"
-
           echo "$TOOLCHAIN" >> "$GITHUB_PATH"
           echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
-
           "$TOOLCHAIN/clang" --version
           dotnet --version
 
@@ -65,7 +61,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           test -f Schneckbert.csproj
           test -f Program.cs
           test -f Evaluate/Evaluate.cs
@@ -73,8 +68,6 @@ jobs:
           test -f Evaluate/NNUEWeights.cs
           test -f Evaluate/NNUESettings.cs
           test -s Evaluate/Nets/simple768_2.bin
-
-          echo "NNUE network:"
           ls -lh Evaluate/Nets/simple768_2.bin
           sha256sum Evaluate/Nets/simple768_2.bin
 
@@ -82,7 +75,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           python3 - <<'PY'
           from pathlib import Path
           import re
@@ -97,16 +89,17 @@ jobs:
               count=1,
               flags=re.S
           )
-
           if count != 1:
               raise SystemExit("Could not update TargetFramework.")
 
+          resource = (
+              '<EmbeddedResource Include="Evaluate/Nets/simple768_2.bin" '
+              'LogicalName="Schneckbert.Evaluate.Nets.simple768_2.bin" />'
+          )
+
           content = re.sub(
               r'<EmbeddedResource\b[^>]*Include="[^"]*simple768_2\.bin"[^>]*/>',
-              (
-                  '<EmbeddedResource Include="Evaluate/Nets/simple768_2.bin" '
-                  'LogicalName="Schneckbert.Evaluate.Nets.simple768_2.bin" />'
-              ),
+              resource,
               content
           )
 
@@ -116,51 +109,37 @@ jobs:
           ):
               content = content.replace(
                   "</Project>",
-                  """
-            <ItemGroup>
-              <EmbeddedResource
-                Include="Evaluate/Nets/simple768_2.bin"
-                LogicalName="Schneckbert.Evaluate.Nets.simple768_2.bin" />
-            </ItemGroup>
-          </Project>
-          """,
+                  f"  <ItemGroup>\n    {resource}\n  </ItemGroup>\n</Project>",
                   1
               )
 
           if "<AssemblyName>Schneckbert</AssemblyName>" not in content:
               content = content.replace(
                   "</Project>",
-                  """
-            <PropertyGroup>
-              <AssemblyName>Schneckbert</AssemblyName>
-            </PropertyGroup>
-          </Project>
-          """,
+                  "  <PropertyGroup>\n"
+                  "    <AssemblyName>Schneckbert</AssemblyName>\n"
+                  "  </PropertyGroup>\n</Project>",
                   1
               )
 
-          content = re.sub(
-              r"<PublishAot>.*?</PublishAot>",
-              "<PublishAot>true</PublishAot>",
-              content,
-              flags=re.S
-          )
-
-          if "<PublishAot>" not in content:
+          if "<PublishAot>" in content:
+              content = re.sub(
+                  r"<PublishAot>.*?</PublishAot>",
+                  "<PublishAot>true</PublishAot>",
+                  content,
+                  flags=re.S
+              )
+          else:
               content = content.replace(
                   "</Project>",
-                  """
-            <PropertyGroup>
-              <PublishAot>true</PublishAot>
-              <SelfContained>true</SelfContained>
-            </PropertyGroup>
-          </Project>
-          """,
+                  "  <PropertyGroup>\n"
+                  "    <PublishAot>true</PublishAot>\n"
+                  "    <SelfContained>true</SelfContained>\n"
+                  "  </PropertyGroup>\n</Project>",
                   1
               )
 
           project.write_text(content, encoding="utf-8")
-          print("Updated Schneckbert.csproj:")
           print(content)
           PY
 
@@ -168,7 +147,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           python3 - <<'PY'
           from pathlib import Path
 
@@ -183,10 +161,8 @@ jobs:
               {
                   if (value < 0)
                       return 0;
-
                   if (value > QA)
                       return QA;
-
                   return value;
               }
 
@@ -196,7 +172,6 @@ jobs:
               {
                   short product = unchecked(
                       (short)(activation * weight));
-
                   return activation * (int)product;
               }
 
@@ -204,7 +179,6 @@ jobs:
               {
                   int outBuck = get_material_bucket(ref p);
                   int evalAccumulator = 0;
-
                   short[] outputWeights = OutputWeight[outBuck][0];
 
                   fixed (Accumulator* accPtr = &this)
@@ -213,13 +187,11 @@ jobs:
                       {
                           short activatedWhite =
                               ClampActivation(accPtr->AccWhite[i]);
-
                           short activatedBlack =
                               ClampActivation(accPtr->AccBlack[i]);
 
                           int whiteWeightIndex =
                               p.us == WHITE ? i : i + FT_SIZE;
-
                           int blackWeightIndex =
                               p.us == BLACK ? i : i + FT_SIZE;
 
@@ -240,9 +212,7 @@ jobs:
                       * SCALE / QAB;
 
                   return Math.Clamp(
-                      eval,
-                      -EVAL_SCORE_MAX,
-                      EVAL_SCORE_MAX);
+                      eval, -EVAL_SCORE_MAX, EVAL_SCORE_MAX);
               }
 
               public unsafe int Evaluate_wdl(ref pos p)
@@ -254,27 +224,23 @@ jobs:
                   {
                       for (int i = 0; i < FT_SIZE; i++)
                       {
-                          short stmActivation =
-                              ClampActivation(
-                                  p.us == WHITE
-                                      ? accPtr->AccWhite[i]
-                                      : accPtr->AccBlack[i]);
+                          short stmActivation = ClampActivation(
+                              p.us == WHITE
+                                  ? accPtr->AccWhite[i]
+                                  : accPtr->AccBlack[i]);
 
-                          short ntmActivation =
-                              ClampActivation(
-                                  p.us == BLACK
-                                      ? accPtr->AccWhite[i]
-                                      : accPtr->AccBlack[i]);
+                          short ntmActivation = ClampActivation(
+                              p.us == BLACK
+                                  ? accPtr->AccWhite[i]
+                                  : accPtr->AccBlack[i]);
 
                           for (int wdl = 0; wdl < 3; wdl++)
                           {
                               short[] weights =
                                   OutputWeight[outBuck][2 - wdl];
 
-                              int contribution =
-                                  SquareMultiply(
-                                      stmActivation,
-                                      weights[i]);
+                              int contribution = SquareMultiply(
+                                  stmActivation, weights[i]);
 
                               contribution = unchecked(
                                   contribution
@@ -288,49 +254,38 @@ jobs:
                       }
                   }
 
-                  double win =
-                      (double)(
-                          outWdl[0] / QA
-                          + OutputBias[outBuck][0]) / QAB;
+                  double win = (double)(
+                      outWdl[0] / QA + OutputBias[outBuck][0]) / QAB;
+                  double draw = (double)(
+                      outWdl[1] / QA + OutputBias[outBuck][1]) / QAB;
+                  double loss = (double)(
+                      outWdl[2] / QA + OutputBias[outBuck][2]) / QAB;
 
-                  double draw =
-                      (double)(
-                          outWdl[1] / QA
-                          + OutputBias[outBuck][1]) / QAB;
-
-                  double loss =
-                      (double)(
-                          outWdl[2] / QA
-                          + OutputBias[outBuck][2]) / QAB;
-
-                  double max = Math.Max(
-                      win,
-                      Math.Max(draw, loss));
-
+                  double max = Math.Max(win, Math.Max(draw, loss));
                   win = Math.Exp(win - max);
                   draw = Math.Exp(draw - max);
                   loss = Math.Exp(loss - max);
 
                   double oneOverNaive =
-                      (win + draw + loss)
-                      / (win + draw / 2);
+                      (win + draw + loss) / (win + draw / 2);
 
                   double scoreCp =
                       -(400 / 3) * Math.Log2(oneOverNaive - 1);
 
                   return Math.Clamp(
-                      (int)scoreCp,
-                      -EVAL_SCORE_MAX,
-                      EVAL_SCORE_MAX);
+                      (int)scoreCp, -EVAL_SCORE_MAX, EVAL_SCORE_MAX);
               }
+
+              // Restored from the original Schneckbert evaluator.
+              private static unsafe int get_material_bucket(ref pos p)
+                  => (Utils.popCount(p.get_blocker()) - 2)
+                     / OUT_BUCK_DIVISOR;
           }
           '''
 
           Path("Evaluate/Evaluate.cs").write_text(
               evaluate.lstrip(), encoding="utf-8"
           )
-
-          print("Replaced Evaluate.cs with scalar NNUE inference.")
 
           updates_path = Path("Evaluate/Updates.cs")
           source = updates_path.read_text(encoding="utf-8-sig")
@@ -346,7 +301,6 @@ jobs:
               global source
 
               method_start = source.find(method_signature)
-
               if method_start < 0:
                   raise SystemExit(
                       f"Method not found: {method_signature}"
@@ -356,14 +310,12 @@ jobs:
                   "for (int i=0; i<ITERATIONS; i++)",
                   method_start
               )
-
               if loop_start < 0:
                   raise SystemExit(
                       f"SIMD loop not found in {method_signature}"
                   )
 
               brace_start = source.find("{", loop_start)
-
               if brace_start < 0:
                   raise SystemExit("Loop opening brace not found.")
 
@@ -473,16 +425,13 @@ jobs:
           )
 
           updates_path.write_text(source, encoding="utf-8")
-          print("Replaced the five AVX2 update loops.")
+          print("Replaced AVX2 update loops with scalar loops.")
           PY
 
       - name: Verify no x86 intrinsics remain
         shell: bash
         run: |
           set -euo pipefail
-
-          echo "Checking C# source for executable x86 SIMD references..."
-
           python3 - <<'PY'
           from pathlib import Path
           import re
@@ -495,41 +444,32 @@ jobs:
               r'\bSse[0-9]*\s*\.',
           ]
 
-          # Remove comments and literals before scanning.
-          # This prevents comments such as
-          # "// Matches Avx2.MultiplyLow" from failing the check.
-          lexical_pattern = re.compile(
+          comment_or_literal = re.compile(
               r'//[^\n]*'
               r'|/\*.*?\*/'
-              r'|@"(?:""|[^"])*"'
               r'|\$?@?"(?:\\.|[^"\\])*"'
               r"|'(?:\\.|[^'\\])*'",
               re.S
           )
 
-          found = []
+          errors = []
 
           for path in Path(".").rglob("*.cs"):
-              if any(
-                  part in {"obj", "bin", ".git"}
-                  for part in path.parts
-              ):
+              if any(part in {"obj", "bin", ".git"} for part in path.parts):
                   continue
 
               source = path.read_text(
-                  encoding="utf-8-sig",
-                  errors="replace"
+                  encoding="utf-8-sig", errors="replace"
               )
-
-              code = lexical_pattern.sub(" ", source)
+              code = comment_or_literal.sub(" ", source)
 
               for pattern in patterns:
                   if re.search(pattern, code):
-                      found.append(f"{path}: {pattern}")
+                      errors.append(f"{path}: {pattern}")
 
-          if found:
-              print("Potential executable x86 SIMD references remain:")
-              print("\n".join(found))
+          if errors:
+              print("Executable x86 SIMD references remain:")
+              print("\n".join(errors))
               sys.exit(1)
 
           print("No executable x86 SIMD references detected.")
@@ -539,13 +479,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           python3 - <<'PY'
           from pathlib import Path
 
           project = Path("Schneckbert.csproj")
           content = project.read_text(encoding="utf-8-sig")
-
           package_id = (
               "Microsoft.NETCore.App.Runtime.NativeAOT."
               "linux-bionic-arm64"
@@ -566,14 +504,12 @@ jobs:
               )
 
           project.write_text(content, encoding="utf-8")
-          print("Configured .NET 10 Android NativeAOT package.")
           PY
 
       - name: Verify runtime pack request
         shell: bash
         run: |
           set -euo pipefail
-
           dotnet msbuild Schneckbert.csproj \
             -getItem:PackageDownload \
             > package-download-items.json
@@ -583,14 +519,12 @@ jobs:
           grep -qi \
             "Microsoft.NETCore.App.Runtime.NativeAOT.linux-bionic-arm64" \
             package-download-items.json
-
           grep -q "10.0.14" package-download-items.json
 
       - name: Restore Android ARM64 NativeAOT
         shell: bash
         run: |
           set -euo pipefail
-
           dotnet restore Schneckbert.csproj \
             --runtime linux-bionic-arm64 \
             --force \
@@ -605,14 +539,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           PACK="$HOME/.nuget/packages/microsoft.netcore.app.runtime.nativeaot.linux-bionic-arm64/10.0.14"
 
           if [ ! -d "$PACK" ]; then
             echo "::error::The .NET 10 Bionic NativeAOT package is missing."
             find "$HOME/.nuget/packages" \
-              -maxdepth 1 -type d \
-              -iname '*nativeaot*' -print
+              -maxdepth 1 -type d -iname '*nativeaot*' -print
             exit 1
           fi
 
@@ -622,7 +554,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           rm -rf out
           mkdir -p out
 
@@ -638,9 +569,7 @@ jobs:
             -p:DisableUnsupportedError=true \
             -p:StripSymbols=true
 
-          echo "Published files:"
           find out -maxdepth 2 -type f -exec ls -lh {} \;
-
           test -s out/Schneckbert
 
       - name: Verify embedded NNUE and Android ELF
@@ -649,22 +578,15 @@ jobs:
           set -euo pipefail
 
           file out/Schneckbert
-
-          readelf -h out/Schneckbert \
-            | grep -E 'Class:|Machine:'
-
+          readelf -h out/Schneckbert | grep -E 'Class:|Machine:'
           readelf -h out/Schneckbert | grep -q AArch64
-
-          echo "Checking embedded NNUE resource name..."
 
           if ! grep -a -q \
             'Schneckbert.Evaluate.Nets.simple768_2.bin' \
             out/Schneckbert; then
-            echo "::error::Embedded NNUE resource name not found in executable."
+            echo "::error::Embedded NNUE resource name not found."
             exit 1
           fi
-
-          echo "Embedded NNUE resource identifier found."
 
           if find out -maxdepth 1 -type f \
             \( -iname '*.bin' -o -iname '*.nnue' \) | grep -q .; then
@@ -672,14 +594,8 @@ jobs:
             exit 1
           fi
 
-          echo "No external NNUE sidecar."
-
-          echo "Executable size:"
           ls -lh out/Schneckbert
-
-          echo "Dynamic dependencies:"
           readelf -d out/Schneckbert | grep NEEDED || true
-
           sha256sum out/Schneckbert
 
       - name: Upload Schneckbert Android ARM64
