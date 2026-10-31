@@ -61,7 +61,7 @@ jobs:
           "$TOOLCHAIN/clang" --version
           dotnet --version
 
-      - name: Verify project and embedded NNUE
+      - name: Verify project and NNUE
         shell: bash
         run: |
           set -euo pipefail
@@ -69,15 +69,16 @@ jobs:
           test -f Schneckbert.csproj
           test -f Program.cs
           test -f Evaluate/Evaluate.cs
+          test -f Evaluate/Updates.cs
           test -f Evaluate/NNUEWeights.cs
           test -f Evaluate/NNUESettings.cs
           test -s Evaluate/Nets/simple768_2.bin
 
-          echo "Network:"
+          echo "NNUE network:"
           ls -lh Evaluate/Nets/simple768_2.bin
           sha256sum Evaluate/Nets/simple768_2.bin
 
-      - name: Configure project and embed NNUE
+      - name: Configure .NET 10 and embed NNUE
         shell: bash
         run: |
           set -euo pipefail
@@ -89,7 +90,7 @@ jobs:
           project = Path("Schneckbert.csproj")
           content = project.read_text(encoding="utf-8-sig")
 
-          content = re.sub(
+          content, count = re.subn(
               r"<TargetFramework>.*?</TargetFramework>",
               "<TargetFramework>net10.0</TargetFramework>",
               content,
@@ -97,27 +98,31 @@ jobs:
               flags=re.S
           )
 
+          if count != 1:
+              raise SystemExit("Could not update TargetFramework.")
+
           network = "Evaluate/Nets/simple768_2.bin"
 
           content = re.sub(
-              r'<EmbeddedResource\s+Include="[^"]*simple768_2\.bin"\s*/>',
-              f'<EmbeddedResource Include="{network}" />',
-              content,
-              flags=re.S
+              r'<EmbeddedResource\b[^>]*Include="[^"]*simple768_2\.bin"[^>]*/>',
+              (
+                  '<EmbeddedResource Include="Evaluate/Nets/simple768_2.bin" '
+                  'LogicalName="Schneckbert.Evaluate.Nets.simple768_2.bin" />'
+              ),
+              content
           )
 
           if not re.search(
-              r'<EmbeddedResource\s+Include="Evaluate/Nets/simple768_2\.bin"\s*/>',
+              r'<EmbeddedResource\b[^>]*Include="Evaluate/Nets/simple768_2\.bin"',
               content
           ):
-              if "</Project>" not in content:
-                  raise SystemExit("Cannot find closing Project element.")
-
               content = content.replace(
                   "</Project>",
-                  f"""
+                  """
             <ItemGroup>
-              <EmbeddedResource Include="{network}" />
+              <EmbeddedResource
+                Include="Evaluate/Nets/simple768_2.bin"
+                LogicalName="Schneckbert.Evaluate.Nets.simple768_2.bin" />
             </ItemGroup>
           </Project>
           """,
@@ -137,8 +142,8 @@ jobs:
               )
 
           content = re.sub(
-              r"<PublishSingleFile>.*?</PublishSingleFile>",
-              "<PublishSingleFile>true</PublishSingleFile>",
+              r"<PublishAot>.*?</PublishAot>",
+              "<PublishAot>true</PublishAot>",
               content,
               flags=re.S
           )
@@ -150,12 +155,406 @@ jobs:
             <PropertyGroup>
               <PublishAot>true</PublishAot>
               <SelfContained>true</SelfContained>
-              <PublishTrimmed>true</PublishTrimmed>
             </PropertyGroup>
           </Project>
           """,
                   1
               )
+
+          project.write_text(content, encoding="utf-8")
+
+          print("Updated Schneckbert.csproj:")
+          print(content)
+          PY
+
+      - name: Replace AVX2 evaluator and accumulator updates
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # -------------------------------------------------------
+          # 1. Scalar replacement for Evaluate.cs
+          # Preserves the original AVX2 signed-short multiply
+          # and multiply-add arithmetic.
+          # -------------------------------------------------------
+
+          evaluate = r'''
+          using static Constants;
+          using static NNUESettings;
+          using static NNUEWeights;
+
+          public unsafe partial struct Accumulator
+          {
+              private static short ClampActivation(short value)
+              {
+                  if (value < 0)
+                      return 0;
+
+                  if (value > QA)
+                      return QA;
+
+                  return value;
+              }
+
+              private static int SquareMultiply(
+                  short activation,
+                  short weight)
+              {
+                  // Matches Avx2.MultiplyLow:
+                  // keep the low 16 bits, interpreted as signed.
+                  short product = unchecked(
+                      (short)(activation * weight));
+
+                  // Matches Avx2.MultiplyAddAdjacent:
+                  // activation * signed-short product.
+                  return activation * (int)product;
+              }
+
+              public unsafe int Evaluate(ref pos p)
+              {
+                  int outBuck = get_material_bucket(ref p);
+                  int evalAccumulator = 0;
+
+                  short[] outputWeights = OutputWeight[outBuck][0];
+
+                  fixed (Accumulator* accPtr = &this)
+                  {
+                      for (int i = 0; i < FT_SIZE; i++)
+                      {
+                          short activatedWhite =
+                              ClampActivation(accPtr->AccWhite[i]);
+
+                          short activatedBlack =
+                              ClampActivation(accPtr->AccBlack[i]);
+
+                          int whiteWeightIndex =
+                              p.us == WHITE ? i : i + FT_SIZE;
+
+                          int blackWeightIndex =
+                              p.us == BLACK ? i : i + FT_SIZE;
+
+                          evalAccumulator = unchecked(
+                              evalAccumulator
+                              + SquareMultiply(
+                                  activatedWhite,
+                                  outputWeights[whiteWeightIndex])
+                              + SquareMultiply(
+                                  activatedBlack,
+                                  outputWeights[blackWeightIndex]));
+                      }
+                  }
+
+                  int eval =
+                      (evalAccumulator / QA
+                       + OutputBias[outBuck][0])
+                      * SCALE / QAB;
+
+                  return Math.Clamp(
+                      eval,
+                      -EVAL_SCORE_MAX,
+                      EVAL_SCORE_MAX);
+              }
+
+              public unsafe int Evaluate_wdl(ref pos p)
+              {
+                  int outBuck = get_material_bucket(ref p);
+
+                  int[] outWdl = new int[3];
+
+                  fixed (Accumulator* accPtr = &this)
+                  {
+                      for (int i = 0; i < FT_SIZE; i++)
+                      {
+                          short stmActivation =
+                              ClampActivation(
+                                  p.us == WHITE
+                                      ? accPtr->AccWhite[i]
+                                      : accPtr->AccBlack[i]);
+
+                          short ntmActivation =
+                              ClampActivation(
+                                  p.us == BLACK
+                                      ? accPtr->AccWhite[i]
+                                      : accPtr->AccBlack[i]);
+
+                          for (int wdl = 0; wdl < 3; wdl++)
+                          {
+                              // Original mapping:
+                              // win = output node 2
+                              // draw = output node 1
+                              // loss = output node 0
+                              short[] weights =
+                                  OutputWeight[outBuck][2 - wdl];
+
+                              int contribution =
+                                  SquareMultiply(
+                                      stmActivation,
+                                      weights[i]);
+
+                              contribution = unchecked(
+                                  contribution
+                                  + SquareMultiply(
+                                      ntmActivation,
+                                      weights[i + FT_SIZE]));
+
+                              outWdl[wdl] = unchecked(
+                                  outWdl[wdl] + contribution);
+                          }
+                      }
+                  }
+
+                  double win =
+                      (double)(
+                          outWdl[0] / QA
+                          + OutputBias[outBuck][0]) / QAB;
+
+                  double draw =
+                      (double)(
+                          outWdl[1] / QA
+                          + OutputBias[outBuck][1]) / QAB;
+
+                  double loss =
+                      (double)(
+                          outWdl[2] / QA
+                          + OutputBias[outBuck][2]) / QAB;
+
+                  double max = Math.Max(
+                      win,
+                      Math.Max(draw, loss));
+
+                  win = Math.Exp(win - max);
+                  draw = Math.Exp(draw - max);
+                  loss = Math.Exp(loss - max);
+
+                  double oneOverNaive =
+                      (win + draw + loss)
+                      / (win + draw / 2);
+
+                  // Preserve the original integer 400 / 3.
+                  double scoreCp =
+                      -(400 / 3) * Math.Log2(oneOverNaive - 1);
+
+                  return Math.Clamp(
+                      (int)scoreCp,
+                      -EVAL_SCORE_MAX,
+                      EVAL_SCORE_MAX);
+              }
+          }
+          '''
+
+          eval_path = Path("Evaluate/Evaluate.cs")
+          eval_path.write_text(evaluate.lstrip(), encoding="utf-8")
+
+          print("Replaced Evaluate.cs with scalar NNUE inference.")
+
+          # -------------------------------------------------------
+          # 2. Scalar replacement for Updates.cs.
+          # Vector256<short>.Add/Subtract wrap at 16 bits.
+          # Use unchecked short arithmetic to preserve that.
+          # -------------------------------------------------------
+
+          updates_path = Path("Evaluate/Updates.cs")
+          source = updates_path.read_text(encoding="utf-8-sig")
+
+          source = source.replace(
+              "using System.Runtime.Intrinsics.X86;\n", ""
+          )
+          source = source.replace(
+              "using System.Runtime.Intrinsics;\n", ""
+          )
+
+          def replace_loop(method_signature, replacement):
+              global source
+
+              method_start = source.find(method_signature)
+
+              if method_start < 0:
+                  raise SystemExit(
+                      f"Method not found: {method_signature}"
+                  )
+
+              loop_start = source.find(
+                  "for (int i=0; i<ITERATIONS; i++)",
+                  method_start
+              )
+
+              if loop_start < 0:
+                  raise SystemExit(
+                      f"SIMD loop not found in {method_signature}"
+                  )
+
+              brace_start = source.find("{", loop_start)
+
+              if brace_start < 0:
+                  raise SystemExit("Loop opening brace not found.")
+
+              depth = 0
+              loop_end = -1
+
+              for index in range(brace_start, len(source)):
+                  if source[index] == "{":
+                      depth += 1
+                  elif source[index] == "}":
+                      depth -= 1
+
+                      if depth == 0:
+                          loop_end = index + 1
+                          break
+
+              if loop_end < 0:
+                  raise SystemExit("Could not match loop braces.")
+
+              source = (
+                  source[:loop_start]
+                  + replacement
+                  + source[loop_end:]
+              )
+
+          replace_loop(
+              "public void AddSub(",
+              """
+                  for (int i = 0; i < FT_SIZE; i++)
+                  {
+                      unchecked
+                      {
+                          ptrWhite[i] = (short)(
+                              ptrWhite[i]
+                              + wWeightAdd[i]
+                              - wWeightSub[i]);
+
+                          ptrBlack[i] = (short)(
+                              ptrBlack[i]
+                              + bWeightAdd[i]
+                              - bWeightSub[i]);
+                      }
+                  }
+              """
+          )
+
+          replace_loop(
+              "public void AddSubSub(",
+              """
+                  for (int i = 0; i < FT_SIZE; i++)
+                  {
+                      unchecked
+                      {
+                          ptrWhite[i] = (short)(
+                              ptrWhite[i]
+                              + wWeights1[i]
+                              - wWeights2[i]
+                              - wWeights3[i]);
+
+                          ptrBlack[i] = (short)(
+                              ptrBlack[i]
+                              + bWeights1[i]
+                              - bWeights2[i]
+                              - bWeights3[i]);
+                      }
+                  }
+              """
+          )
+
+          replace_loop(
+              "public void AddAddSubSub(",
+              """
+                  for (int i = 0; i < FT_SIZE; i++)
+                  {
+                      unchecked
+                      {
+                          ptrWhite[i] = (short)(
+                              ptrWhite[i]
+                              + kingAddW[i]
+                              + rookAddW[i]
+                              - kingSubW[i]
+                              - rookSubW[i]);
+
+                          ptrBlack[i] = (short)(
+                              ptrBlack[i]
+                              + kingAddB[i]
+                              + rookAddB[i]
+                              - kingSubB[i]
+                              - rookSubB[i]);
+                      }
+                  }
+              """
+          )
+
+          replace_loop(
+              "public void activate(",
+              """
+                  for (int i = 0; i < FT_SIZE; i++)
+                  {
+                      unchecked
+                      {
+                          ptrWhite[i] = (short)(
+                              ptrWhite[i] + wWeights[i]);
+
+                          prtBlack[i] = (short)(
+                              prtBlack[i] + bWeights[i]);
+                      }
+                  }
+              """
+          )
+
+          replace_loop(
+              "public void deactivate(",
+              """
+                  for (int i = 0; i < FT_SIZE; i++)
+                  {
+                      unchecked
+                      {
+                          ptrWhite[i] = (short)(
+                              ptrWhite[i] - wWeights[i]);
+
+                          prtBlack[i] = (short)(
+                              prtBlack[i] - bWeights[i]);
+                      }
+                  }
+              """
+          )
+
+          updates_path.write_text(source, encoding="utf-8")
+
+          if "Avx." in source or "Vector256" in source:
+              raise SystemExit(
+                  "AVX instructions remain in Evaluate/Updates.cs."
+              )
+
+          print("Replaced all five AVX2 update loops with scalar code.")
+          PY
+
+      - name: Verify no x86 intrinsics remain
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking C# source for x86 SIMD references..."
+
+          if grep -RInE \
+            'System\.Runtime\.Intrinsics\.X86|Avx2?\.|Vector256|Sse[0-9]*\.' \
+            --include='*.cs' \
+            --exclude-dir=obj \
+            --exclude-dir=bin \
+            .; then
+            echo "::error::x86-specific SIMD references remain."
+            exit 1
+          fi
+
+          echo "No direct x86 SIMD references remain."
+
+      - name: Configure NativeAOT runtime pack
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          project = Path("Schneckbert.csproj")
+          content = project.read_text(encoding="utf-8-sig")
 
           package_id = (
               "Microsoft.NETCore.App.Runtime.NativeAOT."
@@ -177,185 +576,25 @@ jobs:
               )
 
           project.write_text(content, encoding="utf-8")
-          print(content)
+          print("Configured .NET 10 Android NativeAOT package.")
           PY
 
-          echo "Checking embedded resource:"
-          grep -n "EmbeddedResource" Schneckbert.csproj
-
-      - name: Replace AVX2 evaluator with scalar ARM-compatible evaluator
+      - name: Verify runtime pack request
         shell: bash
         run: |
           set -euo pipefail
 
-          python3 - <<'PY'
-          from pathlib import Path
+          dotnet msbuild Schneckbert.csproj \
+            -getItem:PackageDownload \
+            > package-download-items.json
 
-          path = Path("Evaluate/Evaluate.cs")
+          cat package-download-items.json
 
-          source = r'''
-          using static Constants;
-          using static NNUESettings;
-          using static NNUEWeights;
-          using static System.Math;
+          grep -qi \
+            "Microsoft.NETCore.App.Runtime.NativeAOT.linux-bionic-arm64" \
+            package-download-items.json
 
-          public unsafe partial struct Accumulator
-          {
-              private static int ClampActivation(short value)
-                  => value < 0 ? 0 : value > QA ? QA : value;
-
-              private static int PairContribution(
-                  int a0, short w0, int a1, short w1)
-              {
-                  short m0 = unchecked((short)(a0 * w0));
-                  short m1 = unchecked((short)(a1 * w1));
-
-                  return unchecked(a0 * (int)m0 + a1 * (int)m1);
-              }
-
-              public int Evaluate(ref pos p)
-              {
-                  int bucket = get_material_bucket(ref p);
-                  int sum = 0;
-
-                  fixed (Accumulator* self = &this)
-                  {
-                      short* whiteWeights = OutputWeight[bucket][0];
-                      short* blackWeights =
-                          OutputWeight[bucket][0] + FT_SIZE;
-
-                      if (p.us == BLACK)
-                      {
-                          short* temp = whiteWeights;
-                          whiteWeights = blackWeights;
-                          blackWeights = temp;
-                      }
-
-                      for (int i = 0; i < FT_SIZE; i += 2)
-                      {
-                          int aw0 = ClampActivation(self->AccWhite[i]);
-                          int aw1 = ClampActivation(self->AccWhite[i + 1]);
-                          int ab0 = ClampActivation(self->AccBlack[i]);
-                          int ab1 = ClampActivation(self->AccBlack[i + 1]);
-
-                          sum = unchecked(sum + PairContribution(
-                              aw0, whiteWeights[i],
-                              aw1, whiteWeights[i + 1]));
-
-                          sum = unchecked(sum + PairContribution(
-                              ab0, blackWeights[i],
-                              ab1, blackWeights[i + 1]));
-                      }
-                  }
-
-                  int eval = (sum / QA + OutputBias[bucket][0])
-                      * SCALE / QAB;
-
-                  return Clamp(eval, -EVAL_SCORE_MAX, EVAL_SCORE_MAX);
-              }
-
-              public int Evaluate_wdl(ref pos p)
-              {
-                  int bucket = get_material_bucket(ref p);
-
-                  int[] sums = new int[3];
-
-                  fixed (Accumulator* self = &this)
-                  {
-                      for (int i = 0; i < FT_SIZE; i += 2)
-                      {
-                          int stm0 = ClampActivation(
-                              p.us == WHITE
-                                  ? self->AccWhite[i]
-                                  : self->AccBlack[i]);
-
-                          int stm1 = ClampActivation(
-                              p.us == WHITE
-                                  ? self->AccWhite[i + 1]
-                                  : self->AccBlack[i + 1]);
-
-                          int ntm0 = ClampActivation(
-                              p.us == WHITE
-                                  ? self->AccBlack[i]
-                                  : self->AccWhite[i]);
-
-                          int ntm1 = ClampActivation(
-                              p.us == WHITE
-                                  ? self->AccBlack[i + 1]
-                                  : self->AccWhite[i + 1]);
-
-                          for (int wdl = 0; wdl < 3; wdl++)
-                          {
-                              int weightIndex = 2 - wdl;
-                              short[] weights = OutputWeight[bucket][weightIndex];
-
-                              int contribution = PairContribution(
-                                  stm0, weights[i],
-                                  stm1, weights[i + 1]);
-
-                              contribution = unchecked(contribution
-                                  + PairContribution(
-                                      ntm0, weights[i + FT_SIZE],
-                                      ntm1, weights[i + FT_SIZE + 1]));
-
-                              sums[wdl] = unchecked(sums[wdl] + contribution);
-                          }
-                      }
-                  }
-
-                  double win = (double)(
-                      sums[0] / QA + OutputBias[bucket][0]) / QAB;
-
-                  double draw = (double)(
-                      sums[1] / QA + OutputBias[bucket][1]) / QAB;
-
-                  double loss = (double)(
-                      sums[2] / QA + OutputBias[bucket][2]) / QAB;
-
-                  double max = Max(win, Max(draw, loss));
-
-                  win = Exp(win - max);
-                  draw = Exp(draw - max);
-                  loss = Exp(loss - max);
-
-                  double oneOverNaive = (win + draw + loss)
-                      / (win + draw / 2);
-
-                  double scoreCp = -(400.0 / 3.0)
-                      * Log2(oneOverNaive - 1);
-
-                  return Clamp(
-                      (int)scoreCp,
-                      -EVAL_SCORE_MAX,
-                      EVAL_SCORE_MAX);
-              }
-
-              private static int get_material_bucket(ref pos p)
-                  => (Utils.popCount(p.get_blocker()) - 2)
-                      / OUT_BUCK_DIVISOR;
-          }
-          '''
-
-          path.write_text(source.lstrip(), encoding="utf-8")
-          print("Replaced AVX2 evaluation code with scalar evaluation.")
-          PY
-
-      - name: Check for remaining x86 intrinsic code
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if grep -RInE \
-            'System\.Runtime\.Intrinsics\.X86|Avx2?\.|Sse[0-9]' \
-            --include='*.cs' \
-            --exclude-dir=obj \
-            --exclude-dir=bin \
-            .; then
-            echo "::error::Remaining x86-specific intrinsic code needs an ARM-compatible implementation."
-            exit 1
-          fi
-
-          echo "No direct x86 intrinsic references found."
+          grep -q "10.0.14" package-download-items.json
 
       - name: Restore Android ARM64 NativeAOT
         shell: bash
@@ -366,6 +605,7 @@ jobs:
             --runtime linux-bionic-arm64 \
             --force \
             --no-cache \
+            -p:Configuration=Release \
             -p:TargetFramework=net10.0 \
             -p:PublishAot=true \
             -p:PublishAotUsingRuntimePack=true \
@@ -379,15 +619,16 @@ jobs:
           PACK="$HOME/.nuget/packages/microsoft.netcore.app.runtime.nativeaot.linux-bionic-arm64/10.0.14"
 
           if [ ! -d "$PACK" ]; then
-            echo "::error::The .NET 10 Bionic NativeAOT runtime pack was not restored."
+            echo "::error::The .NET 10 Bionic NativeAOT package is missing."
             find "$HOME/.nuget/packages" \
-              -maxdepth 1 -type d -iname '*nativeaot*' -print
+              -maxdepth 1 -type d \
+              -iname '*nativeaot*' -print
             exit 1
           fi
 
-          echo "Runtime pack found: $PACK"
+          echo "NativeAOT package found: $PACK"
 
-      - name: Publish Schneckbert executable
+      - name: Publish Schneckbert ARM64 executable
         shell: bash
         run: |
           set -euo pipefail
@@ -404,6 +645,7 @@ jobs:
             -p:TargetFramework=net10.0 \
             -p:PublishAot=true \
             -p:PublishAotUsingRuntimePack=true \
+            -p:DisableUnsupportedError=true \
             -p:StripSymbols=true
 
           echo "Published files:"
@@ -411,7 +653,7 @@ jobs:
 
           test -s out/Schneckbert
 
-      - name: Verify embedded NNUE and ARM64 ELF
+      - name: Verify embedded NNUE and Android ELF
         shell: bash
         run: |
           set -euo pipefail
@@ -423,15 +665,23 @@ jobs:
 
           readelf -h out/Schneckbert | grep -q AArch64
 
-          if find out -maxdepth 1 -type f \
-            -iname '*.bin' -o -iname '*.nnue' | grep -q .; then
-            echo "::error::Unexpected external network file found."
+          echo "Checking embedded NNUE resource name..."
+          if ! grep -a -q \
+            'Schneckbert.Evaluate.Nets.simple768_2.bin' \
+            out/Schneckbert; then
+            echo "::error::Embedded NNUE resource name not found in executable."
             exit 1
           fi
 
-          echo "Checking embedded resource name in build output:"
-          grep -a -o 'Schneckbert.Evaluate.Nets.simple768_2.bin' \
-            out/Schneckbert | head -1 || true
+          echo "Embedded NNUE resource identifier found."
+
+          if find out -maxdepth 1 -type f \
+            \( -iname '*.bin' -o -iname '*.nnue' \) | grep -q .; then
+            echo "::error::External NNUE sidecar found."
+            exit 1
+          fi
+
+          echo "No external NNUE sidecar."
 
           echo "Executable size:"
           ls -lh out/Schneckbert
