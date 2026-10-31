@@ -101,8 +101,6 @@ jobs:
           if count != 1:
               raise SystemExit("Could not update TargetFramework.")
 
-          network = "Evaluate/Nets/simple768_2.bin"
-
           content = re.sub(
               r'<EmbeddedResource\b[^>]*Include="[^"]*simple768_2\.bin"[^>]*/>',
               (
@@ -162,7 +160,6 @@ jobs:
               )
 
           project.write_text(content, encoding="utf-8")
-
           print("Updated Schneckbert.csproj:")
           print(content)
           PY
@@ -174,12 +171,6 @@ jobs:
 
           python3 - <<'PY'
           from pathlib import Path
-
-          # -------------------------------------------------------
-          # 1. Scalar replacement for Evaluate.cs
-          # Preserves the original AVX2 signed-short multiply
-          # and multiply-add arithmetic.
-          # -------------------------------------------------------
 
           evaluate = r'''
           using static Constants;
@@ -203,13 +194,9 @@ jobs:
                   short activation,
                   short weight)
               {
-                  // Matches Avx2.MultiplyLow:
-                  // keep the low 16 bits, interpreted as signed.
                   short product = unchecked(
                       (short)(activation * weight));
 
-                  // Matches Avx2.MultiplyAddAdjacent:
-                  // activation * signed-short product.
                   return activation * (int)product;
               }
 
@@ -261,7 +248,6 @@ jobs:
               public unsafe int Evaluate_wdl(ref pos p)
               {
                   int outBuck = get_material_bucket(ref p);
-
                   int[] outWdl = new int[3];
 
                   fixed (Accumulator* accPtr = &this)
@@ -282,10 +268,6 @@ jobs:
 
                           for (int wdl = 0; wdl < 3; wdl++)
                           {
-                              // Original mapping:
-                              // win = output node 2
-                              // draw = output node 1
-                              // loss = output node 0
                               short[] weights =
                                   OutputWeight[outBuck][2 - wdl];
 
@@ -333,7 +315,6 @@ jobs:
                       (win + draw + loss)
                       / (win + draw / 2);
 
-                  // Preserve the original integer 400 / 3.
                   double scoreCp =
                       -(400 / 3) * Math.Log2(oneOverNaive - 1);
 
@@ -345,16 +326,11 @@ jobs:
           }
           '''
 
-          eval_path = Path("Evaluate/Evaluate.cs")
-          eval_path.write_text(evaluate.lstrip(), encoding="utf-8")
+          Path("Evaluate/Evaluate.cs").write_text(
+              evaluate.lstrip(), encoding="utf-8"
+          )
 
           print("Replaced Evaluate.cs with scalar NNUE inference.")
-
-          # -------------------------------------------------------
-          # 2. Scalar replacement for Updates.cs.
-          # Vector256<short>.Add/Subtract wrap at 16 bits.
-          # Use unchecked short arithmetic to preserve that.
-          # -------------------------------------------------------
 
           updates_path = Path("Evaluate/Updates.cs")
           source = updates_path.read_text(encoding="utf-8-sig")
@@ -399,7 +375,6 @@ jobs:
                       depth += 1
                   elif source[index] == "}":
                       depth -= 1
-
                       if depth == 0:
                           loop_end = index + 1
                           break
@@ -421,14 +396,9 @@ jobs:
                       unchecked
                       {
                           ptrWhite[i] = (short)(
-                              ptrWhite[i]
-                              + wWeightAdd[i]
-                              - wWeightSub[i]);
-
+                              ptrWhite[i] + wWeightAdd[i] - wWeightSub[i]);
                           ptrBlack[i] = (short)(
-                              ptrBlack[i]
-                              + bWeightAdd[i]
-                              - bWeightSub[i]);
+                              ptrBlack[i] + bWeightAdd[i] - bWeightSub[i]);
                       }
                   }
               """
@@ -442,16 +412,11 @@ jobs:
                       unchecked
                       {
                           ptrWhite[i] = (short)(
-                              ptrWhite[i]
-                              + wWeights1[i]
-                              - wWeights2[i]
-                              - wWeights3[i]);
-
+                              ptrWhite[i] + wWeights1[i]
+                              - wWeights2[i] - wWeights3[i]);
                           ptrBlack[i] = (short)(
-                              ptrBlack[i]
-                              + bWeights1[i]
-                              - bWeights2[i]
-                              - bWeights3[i]);
+                              ptrBlack[i] + bWeights1[i]
+                              - bWeights2[i] - bWeights3[i]);
                       }
                   }
               """
@@ -465,18 +430,11 @@ jobs:
                       unchecked
                       {
                           ptrWhite[i] = (short)(
-                              ptrWhite[i]
-                              + kingAddW[i]
-                              + rookAddW[i]
-                              - kingSubW[i]
-                              - rookSubW[i]);
-
+                              ptrWhite[i] + kingAddW[i] + rookAddW[i]
+                              - kingSubW[i] - rookSubW[i]);
                           ptrBlack[i] = (short)(
-                              ptrBlack[i]
-                              + kingAddB[i]
-                              + rookAddB[i]
-                              - kingSubB[i]
-                              - rookSubB[i]);
+                              ptrBlack[i] + kingAddB[i] + rookAddB[i]
+                              - kingSubB[i] - rookSubB[i]);
                       }
                   }
               """
@@ -491,7 +449,6 @@ jobs:
                       {
                           ptrWhite[i] = (short)(
                               ptrWhite[i] + wWeights[i]);
-
                           prtBlack[i] = (short)(
                               prtBlack[i] + bWeights[i]);
                       }
@@ -508,7 +465,6 @@ jobs:
                       {
                           ptrWhite[i] = (short)(
                               ptrWhite[i] - wWeights[i]);
-
                           prtBlack[i] = (short)(
                               prtBlack[i] - bWeights[i]);
                       }
@@ -517,13 +473,7 @@ jobs:
           )
 
           updates_path.write_text(source, encoding="utf-8")
-
-          if "Avx." in source or "Vector256" in source:
-              raise SystemExit(
-                  "AVX instructions remain in Evaluate/Updates.cs."
-              )
-
-          print("Replaced all five AVX2 update loops with scalar code.")
+          print("Replaced the five AVX2 update loops.")
           PY
 
       - name: Verify no x86 intrinsics remain
@@ -531,19 +481,59 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Checking C# source for x86 SIMD references..."
+          echo "Checking C# source for executable x86 SIMD references..."
 
-          if grep -RInE \
-            'System\.Runtime\.Intrinsics\.X86|Avx2?\.|Vector256|Sse[0-9]*\.' \
-            --include='*.cs' \
-            --exclude-dir=obj \
-            --exclude-dir=bin \
-            .; then
-            echo "::error::x86-specific SIMD references remain."
-            exit 1
-          fi
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import sys
 
-          echo "No direct x86 SIMD references remain."
+          patterns = [
+              r'System\.Runtime\.Intrinsics\.X86',
+              r'\bAvx2?\s*\.',
+              r'\bVector256\b',
+              r'\bSse[0-9]*\s*\.',
+          ]
+
+          # Remove comments and literals before scanning.
+          # This prevents comments such as
+          # "// Matches Avx2.MultiplyLow" from failing the check.
+          lexical_pattern = re.compile(
+              r'//[^\n]*'
+              r'|/\*.*?\*/'
+              r'|@"(?:""|[^"])*"'
+              r'|\$?@?"(?:\\.|[^"\\])*"'
+              r"|'(?:\\.|[^'\\])*'",
+              re.S
+          )
+
+          found = []
+
+          for path in Path(".").rglob("*.cs"):
+              if any(
+                  part in {"obj", "bin", ".git"}
+                  for part in path.parts
+              ):
+                  continue
+
+              source = path.read_text(
+                  encoding="utf-8-sig",
+                  errors="replace"
+              )
+
+              code = lexical_pattern.sub(" ", source)
+
+              for pattern in patterns:
+                  if re.search(pattern, code):
+                      found.append(f"{path}: {pattern}")
+
+          if found:
+              print("Potential executable x86 SIMD references remain:")
+              print("\n".join(found))
+              sys.exit(1)
+
+          print("No executable x86 SIMD references detected.")
+          PY
 
       - name: Configure NativeAOT runtime pack
         shell: bash
@@ -666,6 +656,7 @@ jobs:
           readelf -h out/Schneckbert | grep -q AArch64
 
           echo "Checking embedded NNUE resource name..."
+
           if ! grep -a -q \
             'Schneckbert.Evaluate.Nets.simple768_2.bin' \
             out/Schneckbert; then
