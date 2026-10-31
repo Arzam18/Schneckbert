@@ -1,0 +1,450 @@
+
+name: Schneckbert Android ARM64 NativeAOT
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - "**.cs"
+      - "**.csproj"
+      - "Evaluate/Nets/**"
+      - ".github/workflows/android.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Schneckbert UCI for Android ARM64
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout Schneckbert
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.403
+
+      - name: Install build utilities
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang lld llvm binutils \
+            build-essential zlib1g-dev python3
+
+      - name: Install Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          add-to-path: false
+
+      - name: Configure Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+          test -x "$TOOLCHAIN/clang"
+
+          echo "$TOOLCHAIN" >> "$GITHUB_PATH"
+          echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+
+          "$TOOLCHAIN/clang" --version
+          dotnet --version
+
+      - name: Verify project and embedded NNUE
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f Schneckbert.csproj
+          test -f Program.cs
+          test -f Evaluate/Evaluate.cs
+          test -f Evaluate/NNUEWeights.cs
+          test -f Evaluate/NNUESettings.cs
+          test -s Evaluate/Nets/simple768_2.bin
+
+          echo "Network:"
+          ls -lh Evaluate/Nets/simple768_2.bin
+          sha256sum Evaluate/Nets/simple768_2.bin
+
+      - name: Configure project and embed NNUE
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          project = Path("Schneckbert.csproj")
+          content = project.read_text(encoding="utf-8-sig")
+
+          content = re.sub(
+              r"<TargetFramework>.*?</TargetFramework>",
+              "<TargetFramework>net10.0</TargetFramework>",
+              content,
+              count=1,
+              flags=re.S
+          )
+
+          network = "Evaluate/Nets/simple768_2.bin"
+
+          content = re.sub(
+              r'<EmbeddedResource\s+Include="[^"]*simple768_2\.bin"\s*/>',
+              f'<EmbeddedResource Include="{network}" />',
+              content,
+              flags=re.S
+          )
+
+          if not re.search(
+              r'<EmbeddedResource\s+Include="Evaluate/Nets/simple768_2\.bin"\s*/>',
+              content
+          ):
+              if "</Project>" not in content:
+                  raise SystemExit("Cannot find closing Project element.")
+
+              content = content.replace(
+                  "</Project>",
+                  f"""
+            <ItemGroup>
+              <EmbeddedResource Include="{network}" />
+            </ItemGroup>
+          </Project>
+          """,
+                  1
+              )
+
+          if "<AssemblyName>Schneckbert</AssemblyName>" not in content:
+              content = content.replace(
+                  "</Project>",
+                  """
+            <PropertyGroup>
+              <AssemblyName>Schneckbert</AssemblyName>
+            </PropertyGroup>
+          </Project>
+          """,
+                  1
+              )
+
+          content = re.sub(
+              r"<PublishSingleFile>.*?</PublishSingleFile>",
+              "<PublishSingleFile>true</PublishSingleFile>",
+              content,
+              flags=re.S
+          )
+
+          if "<PublishAot>" not in content:
+              content = content.replace(
+                  "</Project>",
+                  """
+            <PropertyGroup>
+              <PublishAot>true</PublishAot>
+              <SelfContained>true</SelfContained>
+              <PublishTrimmed>true</PublishTrimmed>
+            </PropertyGroup>
+          </Project>
+          """,
+                  1
+              )
+
+          package_id = (
+              "Microsoft.NETCore.App.Runtime.NativeAOT."
+              "linux-bionic-arm64"
+          )
+
+          if package_id not in content:
+              content = content.replace(
+                  "</Project>",
+                  """
+            <ItemGroup>
+              <PackageDownload
+                Include="Microsoft.NETCore.App.Runtime.NativeAOT.linux-bionic-arm64"
+                Version="[10.0.14]" />
+            </ItemGroup>
+          </Project>
+          """,
+                  1
+              )
+
+          project.write_text(content, encoding="utf-8")
+          print(content)
+          PY
+
+          echo "Checking embedded resource:"
+          grep -n "EmbeddedResource" Schneckbert.csproj
+
+      - name: Replace AVX2 evaluator with scalar ARM-compatible evaluator
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("Evaluate/Evaluate.cs")
+
+          source = r'''
+          using static Constants;
+          using static NNUESettings;
+          using static NNUEWeights;
+          using static System.Math;
+
+          public unsafe partial struct Accumulator
+          {
+              private static int ClampActivation(short value)
+                  => value < 0 ? 0 : value > QA ? QA : value;
+
+              private static int PairContribution(
+                  int a0, short w0, int a1, short w1)
+              {
+                  short m0 = unchecked((short)(a0 * w0));
+                  short m1 = unchecked((short)(a1 * w1));
+
+                  return unchecked(a0 * (int)m0 + a1 * (int)m1);
+              }
+
+              public int Evaluate(ref pos p)
+              {
+                  int bucket = get_material_bucket(ref p);
+                  int sum = 0;
+
+                  fixed (Accumulator* self = &this)
+                  {
+                      short* whiteWeights = OutputWeight[bucket][0];
+                      short* blackWeights =
+                          OutputWeight[bucket][0] + FT_SIZE;
+
+                      if (p.us == BLACK)
+                      {
+                          short* temp = whiteWeights;
+                          whiteWeights = blackWeights;
+                          blackWeights = temp;
+                      }
+
+                      for (int i = 0; i < FT_SIZE; i += 2)
+                      {
+                          int aw0 = ClampActivation(self->AccWhite[i]);
+                          int aw1 = ClampActivation(self->AccWhite[i + 1]);
+                          int ab0 = ClampActivation(self->AccBlack[i]);
+                          int ab1 = ClampActivation(self->AccBlack[i + 1]);
+
+                          sum = unchecked(sum + PairContribution(
+                              aw0, whiteWeights[i],
+                              aw1, whiteWeights[i + 1]));
+
+                          sum = unchecked(sum + PairContribution(
+                              ab0, blackWeights[i],
+                              ab1, blackWeights[i + 1]));
+                      }
+                  }
+
+                  int eval = (sum / QA + OutputBias[bucket][0])
+                      * SCALE / QAB;
+
+                  return Clamp(eval, -EVAL_SCORE_MAX, EVAL_SCORE_MAX);
+              }
+
+              public int Evaluate_wdl(ref pos p)
+              {
+                  int bucket = get_material_bucket(ref p);
+
+                  int[] sums = new int[3];
+
+                  fixed (Accumulator* self = &this)
+                  {
+                      for (int i = 0; i < FT_SIZE; i += 2)
+                      {
+                          int stm0 = ClampActivation(
+                              p.us == WHITE
+                                  ? self->AccWhite[i]
+                                  : self->AccBlack[i]);
+
+                          int stm1 = ClampActivation(
+                              p.us == WHITE
+                                  ? self->AccWhite[i + 1]
+                                  : self->AccBlack[i + 1]);
+
+                          int ntm0 = ClampActivation(
+                              p.us == WHITE
+                                  ? self->AccBlack[i]
+                                  : self->AccWhite[i]);
+
+                          int ntm1 = ClampActivation(
+                              p.us == WHITE
+                                  ? self->AccBlack[i + 1]
+                                  : self->AccWhite[i + 1]);
+
+                          for (int wdl = 0; wdl < 3; wdl++)
+                          {
+                              int weightIndex = 2 - wdl;
+                              short[] weights = OutputWeight[bucket][weightIndex];
+
+                              int contribution = PairContribution(
+                                  stm0, weights[i],
+                                  stm1, weights[i + 1]);
+
+                              contribution = unchecked(contribution
+                                  + PairContribution(
+                                      ntm0, weights[i + FT_SIZE],
+                                      ntm1, weights[i + FT_SIZE + 1]));
+
+                              sums[wdl] = unchecked(sums[wdl] + contribution);
+                          }
+                      }
+                  }
+
+                  double win = (double)(
+                      sums[0] / QA + OutputBias[bucket][0]) / QAB;
+
+                  double draw = (double)(
+                      sums[1] / QA + OutputBias[bucket][1]) / QAB;
+
+                  double loss = (double)(
+                      sums[2] / QA + OutputBias[bucket][2]) / QAB;
+
+                  double max = Max(win, Max(draw, loss));
+
+                  win = Exp(win - max);
+                  draw = Exp(draw - max);
+                  loss = Exp(loss - max);
+
+                  double oneOverNaive = (win + draw + loss)
+                      / (win + draw / 2);
+
+                  double scoreCp = -(400.0 / 3.0)
+                      * Log2(oneOverNaive - 1);
+
+                  return Clamp(
+                      (int)scoreCp,
+                      -EVAL_SCORE_MAX,
+                      EVAL_SCORE_MAX);
+              }
+
+              private static int get_material_bucket(ref pos p)
+                  => (Utils.popCount(p.get_blocker()) - 2)
+                      / OUT_BUCK_DIVISOR;
+          }
+          '''
+
+          path.write_text(source.lstrip(), encoding="utf-8")
+          print("Replaced AVX2 evaluation code with scalar evaluation.")
+          PY
+
+      - name: Check for remaining x86 intrinsic code
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if grep -RInE \
+            'System\.Runtime\.Intrinsics\.X86|Avx2?\.|Sse[0-9]' \
+            --include='*.cs' \
+            --exclude-dir=obj \
+            --exclude-dir=bin \
+            .; then
+            echo "::error::Remaining x86-specific intrinsic code needs an ARM-compatible implementation."
+            exit 1
+          fi
+
+          echo "No direct x86 intrinsic references found."
+
+      - name: Restore Android ARM64 NativeAOT
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          dotnet restore Schneckbert.csproj \
+            --runtime linux-bionic-arm64 \
+            --force \
+            --no-cache \
+            -p:TargetFramework=net10.0 \
+            -p:PublishAot=true \
+            -p:PublishAotUsingRuntimePack=true \
+            -p:SelfContained=true
+
+      - name: Verify NativeAOT runtime pack
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PACK="$HOME/.nuget/packages/microsoft.netcore.app.runtime.nativeaot.linux-bionic-arm64/10.0.14"
+
+          if [ ! -d "$PACK" ]; then
+            echo "::error::The .NET 10 Bionic NativeAOT runtime pack was not restored."
+            find "$HOME/.nuget/packages" \
+              -maxdepth 1 -type d -iname '*nativeaot*' -print
+            exit 1
+          fi
+
+          echo "Runtime pack found: $PACK"
+
+      - name: Publish Schneckbert executable
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf out
+          mkdir -p out
+
+          dotnet publish Schneckbert.csproj \
+            --configuration Release \
+            --runtime linux-bionic-arm64 \
+            --self-contained true \
+            --no-restore \
+            --output out \
+            -p:TargetFramework=net10.0 \
+            -p:PublishAot=true \
+            -p:PublishAotUsingRuntimePack=true \
+            -p:StripSymbols=true
+
+          echo "Published files:"
+          find out -maxdepth 2 -type f -exec ls -lh {} \;
+
+          test -s out/Schneckbert
+
+      - name: Verify embedded NNUE and ARM64 ELF
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          file out/Schneckbert
+
+          readelf -h out/Schneckbert \
+            | grep -E 'Class:|Machine:'
+
+          readelf -h out/Schneckbert | grep -q AArch64
+
+          if find out -maxdepth 1 -type f \
+            -iname '*.bin' -o -iname '*.nnue' | grep -q .; then
+            echo "::error::Unexpected external network file found."
+            exit 1
+          fi
+
+          echo "Checking embedded resource name in build output:"
+          grep -a -o 'Schneckbert.Evaluate.Nets.simple768_2.bin' \
+            out/Schneckbert | head -1 || true
+
+          echo "Executable size:"
+          ls -lh out/Schneckbert
+
+          echo "Dynamic dependencies:"
+          readelf -d out/Schneckbert | grep NEEDED || true
+
+          sha256sum out/Schneckbert
+
+      - name: Upload Schneckbert Android ARM64
+        uses: actions/upload-artifact@v4
+        with:
+          name: Schneckbert-Android-ARM64-Embedded-NNUE
+          path: out/Schneckbert
+          if-no-files-found: error
+          retention-days: 14
